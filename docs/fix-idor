@@ -1,0 +1,454 @@
+"""
+This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license.
+"""
+import logging
+import inspect
+import os
+
+from rest_framework import generics
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.response import Response
+from rest_framework.exceptions import NotFound, PermissionDenied
+from drf_yasg import openapi as openapi
+from django.conf import settings
+from drf_yasg.utils import swagger_auto_schema
+
+from core.permissions import all_permissions, permission_org
+from core.utils.common import get_object_with_check_and_log
+from core.utils.io import read_yaml
+from io_storages.serializers import ImportStorageSerializer, ExportStorageSerializer
+from projects.models import Project
+from core.services.minio_client import MinioClient
+from core.permissions import IsSuperAdminOrg
+
+from organizations.models import OrganizationMember, Organization
+from rest_framework.exceptions import ValidationError
+from .s3.models import S3ImportStorage
+# from .localfiles.models import LocalFilesImportStorage
+from .gdriver.models import GDriverImportStorage
+from .gcs.models import  GCSImportStorage
+from .redis.models import  RedisImportStorage
+from .azure_blob.models import  AzureBlobImportStorage
+
+from .s3.models import S3ExportStorage
+# from .localfiles.models import LocalFilesExportStorage
+from .gdriver.models import GDriverExportStorage
+from .gcs.models import  GCSExportStorage
+from .redis.models import  RedisExportStorage
+from .azure_blob.models import  AzureBlobExportStorage
+from projects.models import Project
+
+from io_storages.s3.storage_server import S3Server
+
+logger = logging.getLogger(__name__)
+
+class ImportStorageListAPI(generics.ListCreateAPIView):
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    permission_required = all_permissions.projects_change
+    serializer_class = ImportStorageSerializer
+
+    def get_queryset(self):
+        project_pk = self.request.query_params.get('project')
+        if not project_pk:
+            # Fix: Return empty queryset if no project is specified to prevent listing all storages
+            logger.warning(f"User {self.request.user.id} attempted to list storages without project ID")
+            return self.serializer_class.Meta.model.objects.none()
+
+        try:
+            project = get_object_with_check_and_log(self.request, Project, pk=project_pk)
+            # Fix: Explicitly check organization permissions
+            if not permission_org(self.request.user, project):
+                logger.warning(f"User {self.request.user.id} lacks permission for project {project_pk}")
+                raise PermissionDenied("User lacks organization permissions")
+            self.check_object_permissions(self.request, project)
+            ImportStorageClass = self.serializer_class.Meta.model
+            # Fix: Filter by project and user’s organization
+            return ImportStorageClass.objects.filter(project=project, org_id=project.organization_id)
+        except Project.DoesNotExist:
+            logger.warning(f"User {self.request.user.id} requested non-existent project {project_pk}")
+            raise NotFound("Project not found")
+
+    def post(self, request, *args, **kwargs):
+        project_id = self.request.data.get('project')
+        if not project_id:
+            raise ValidationError("Project ID is required", code=400)
+
+        try:
+            project = Project.objects.get(id=project_id)
+            # Fix: Check organization permissions
+            if not permission_org(self.request.user, project):
+                logger.warning(f"User {self.request.user.id} lacks permission to create storage for project {project_id}")
+                raise PermissionDenied("User lacks organization permissions")
+                
+            check_org_admin = OrganizationMember.objects.filter(
+                organization_id=project.organization_id,
+                user_id=self.request.user.id,
+                is_admin=True
+            ).exists()
+            
+            if not check_org_admin and not self.request.user.is_superuser:
+                raise ValidationError("You do not have permission to setup this project", code=403)
+
+            serializer = self.get_serializer(data=self.request.data)
+            serializer.is_valid(raise_exception=True)
+            storage = serializer.save()
+
+            # Sync logic for another storage
+            def sync_another_storage(storage):
+                try:
+                    storage.create_folder(f"raw_files_{project.pk}")
+                except Exception as e:
+                    logger.error(f"Error syncing storage for project {project.pk}: {e}")
+
+            import threading
+            storage_thread = threading.Thread(target=sync_another_storage, args=(storage,))
+            storage_thread.start()
+
+            return Response(self.serializer_class(storage).data)
+        except Project.DoesNotExist:
+            logger.warning(f"User {self.request.user.id} requested non-existent project {project_id}")
+            raise NotFound("Project not found")
+
+class ImportStorageDetailAPI(generics.RetrieveUpdateDestroyAPIView):
+    """RUD storage by pk specified in URL"""
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    serializer_class = ImportStorageSerializer
+    permission_required = all_permissions.projects_change
+    permission_classes = [IsSuperAdminOrg]
+
+    def get_queryset(self):
+        # Fix: Restrict queryset to storages accessible by user’s organization
+        ImportStorageClass = self.serializer_class.Meta.model
+        if self.request.user.is_superuser:
+            return ImportStorageClass.objects.all()
+        return ImportStorageClass.objects.filter(
+            org_id__in=OrganizationMember.objects.filter(
+                user_id=self.request.user.id
+            ).values('organization_id')
+        )
+
+    def get_object(self):
+        obj = super().get_object()
+        # Fix: Strengthen permission check to prevent IDOR
+        if not permission_org(self.request.user, obj.project):
+            logger.warning(
+                f"User {self.request.user.id} attempted unauthorized access to storage {obj.id} for project {obj.project.id}"
+            )
+            raise PermissionDenied("User lacks organization permissions")
+        return obj
+
+    @swagger_auto_schema(auto_schema=None)
+    def put(self, request, *args, **kwargs):
+        return super().put(request, *args, **kwargs)
+
+class ExportStorageListAPI(generics.ListCreateAPIView):
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    permission_required = all_permissions.projects_change
+    serializer_class = ExportStorageSerializer
+
+    def get_queryset(self):
+        project_pk = self.request.query_params.get('project')
+        if not project_pk:
+            # Fix: Return empty queryset if no project is specified
+            logger.warning(f"User {self.request.user.id} attempted to list export storages without project ID")
+            return self.serializer_class.Meta.model.objects.none()
+
+        try:
+            project = get_object_with_check_and_log(self.request, Project, pk=project_pk)
+            # Fix: Explicitly check organization permissions
+            if not permission_org(self.request.user, project):
+                logger.warning(f"User {self.request.user.id} lacks permission for project {project_pk}")
+                raise PermissionDenied("User lacks organization permissions")
+            self.check_object_permissions(self.request, project)
+            ExportStorageClass = self.serializer_class.Meta.model
+            # Fix: Filter by project and user’s organization
+            return ExportStorageClass.objects.filter(project_id=project.id, org_id=project.organization_id)
+        except Project.DoesNotExist:
+            logger.warning(f"User {self.request.user.id} requested non-existent project {project_pk}")
+            raise NotFound("Project not found")
+
+    def perform_create(self, serializer):
+        if self.request.data.get('is_global') == 1 or self.request.data.get('project') == None:
+            kwargs = self.request.data
+            if kwargs.get('storage_type') == "s3":
+                storage = S3ImportStorage(
+                    title=kwargs.get('title'),
+                    region_name=kwargs.get('region_name'),
+                    bucket=kwargs.get('bucket'),
+                    aws_access_key_id=kwargs.get('aws_access_key_id'),
+                    aws_secret_access_key=kwargs.get('aws_secret_access_key'),
+                    s3_endpoint=kwargs.get('s3_endpoint').strip(),
+                    aws_session_token=kwargs.get('aws_session_token'),
+                    use_blob_urls=True,
+                    regex_filter=kwargs.get('regex_filter'),
+                    is_global=True,
+                    user_id=self.request.user.id,
+                    project_id=kwargs.get('pk'),
+                    org_id=self.request.user.active_organization_id
+                )
+                storage.validate_connection()
+                storage.save()
+                storage.refresh_from_db()
+                return Response(status=200)
+            elif kwargs.get('storage_type', "") == "azure":
+                storage = AzureBlobImportStorage(
+                    title=kwargs.get('title'),
+                    container=kwargs.get('container'),
+                    prefix=kwargs.get('prefix'),
+                    regex_filter=kwargs.get('regex_filter'),
+                    account_name=kwargs.get('account_name'),
+                    account_key=kwargs.get('account_key'),
+                    use_blob_urls=True,
+                    is_global=True,
+                    user_id=self.request.user.id,
+                    org_id=self.request.user.active_organization_id,
+                    project_id=kwargs.get('pk')
+                )
+                storage.validate_connection()
+                storage.save()
+                storage.refresh_from_db()
+                return Response(status=200)
+            elif kwargs.get('storage_type', "") == "redis":
+                storage = RedisImportStorage(
+                    title=kwargs.get('title'),
+                    path=kwargs.get('path'),
+                    host=kwargs.get('host'),
+                    port=kwargs.get('port'),
+                    password=kwargs.get('password'),
+                    is_global=True,
+                    user_id=self.request.user.id,
+                    org_id=self.request.user.active_organization_id,
+                    project_id=kwargs.get('pk')
+                )
+                storage.validate_connection()
+                storage.save()
+                storage.refresh_from_db()
+                return Response(status=200)
+            elif kwargs.get('storage_type', "") == "gdriver":
+                storage = GDriverImportStorage(
+                    title=kwargs.get('title'),
+                    bucket=kwargs.get('bucket'),
+                    prefix=kwargs.get('prefix'),
+                    regex_filter=kwargs.get('regex'),
+                    google_application_credentials=kwargs.get('google_application_credentials'),
+                    use_blob_urls=True,
+                    is_global=True,
+                    user_id=self.request.user.id,
+                    org_id=self.request.user.active_organization_id
+                )
+                storage.validate_connection()
+                storage.save()
+                storage.refresh_from_db()
+                return Response(status=200)
+            elif kwargs.get('storage_type', "") == "gcs":
+                storage = GCSImportStorage(
+                    title=kwargs.get('title'),
+                    project=kwargs.get('pk'),
+                    bucket=kwargs.get('bucket'),
+                    prefix=kwargs.get('prefix'),
+                    regex_filter=kwargs.get('regex_filter'),
+                    google_application_credentials=kwargs.get('google_application_credentials'),
+                    use_blob_urls=True,
+                    is_global=True,
+                    user_id=self.request.user.id,
+                    org_id=self.request.user.active_organization_id
+                )
+                storage.validate_connection()
+                storage.save()
+                storage.refresh_from_db()
+                return Response(status=200)
+        else:
+            project_id = self.request.data.get('project')
+            if not project_id:
+                raise ValidationError("Project ID is required", code=400)
+
+            try:
+                project = Project.objects.get(id=project_id)
+                # Fix: Check organization permissions
+                if not permission_org(self.request.user, project):
+                    logger.warning(f"User {self.request.user.id} lacks permission to create export storage for project {project_id}")
+                    raise PermissionDenied("User lacks organization permissions")
+                    
+                check_org_admin = OrganizationMember.objects.filter(
+                    organization_id=project.organization_id,
+                    user_id=self.request.user.id,
+                    is_admin=True
+                ).exists()
+                if not check_org_admin:
+                    if not project.organization.created_by_id == self.request.user.id and not self.request.user.is_superuser:
+                        raise ValidationError("You do not have permission to setup this project", code=403)
+
+                import_id = self.request.data.get("import_id")
+                serializer = self.get_serializer(data=self.request.data)
+                serializer.is_valid(raise_exception=True)
+                storage = serializer.save()
+
+                if import_id:
+                    storage.create_connect_to_import_storage(import_id)
+
+                if settings.SYNC_ON_TARGET_STORAGE_CREATION:
+                    storage.sync()
+            except Project.DoesNotExist:
+                logger.warning(f"User {self.request.user.id} requested non-existent project {project_id}")
+                raise NotFound("Project not found")
+
+class ExportStorageDetailAPI(generics.RetrieveUpdateDestroyAPIView):
+    """RUD storage by pk specified in URL"""
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    serializer_class = ExportStorageSerializer
+    permission_required = all_permissions.projects_change
+    permission_classes = [IsSuperAdminOrg]
+
+    def get_queryset(self):
+        # Fix: Restrict queryset to storages accessible by user’s organization
+        ExportStorageClass = self.serializer_class.Meta.model
+        if self.request.user.is_superuser:
+            return ExportStorageClass.objects.all()
+        return ExportStorageClass.objects.filter(
+            org_id__in=OrganizationMember.objects.filter(
+                user_id=self.request.user.id
+            ).values('organization_id')
+        )
+
+    def get_object(self):
+        obj = super().get_object()
+        # Fix: Strengthen permission check to prevent IDOR
+        if not permission_org(self.request.user, obj.project):
+            logger.warning(
+                f"User {self.request.user.id} attempted unauthorized access to export storage {obj.id} for project {obj.project.id}"
+            )
+            raise PermissionDenied("User lacks organization permissions")
+        return obj
+
+    @swagger_auto_schema(auto_schema=None)
+    def put(self, request, *args, **kwargs):
+        return super().put(request, *args, **kwargs)
+
+# Remaining classes (ImportStorageSyncAPI, ExportStorageSyncAPI, etc.) are unchanged as they don’t directly handle the vulnerable endpoint
+class ImportStorageSyncAPI(generics.GenericAPIView):
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    permission_required = all_permissions.projects_change
+    serializer_class = ImportStorageSerializer
+
+    def get_queryset(self):
+        ImportStorageClass = self.serializer_class.Meta.model
+        return ImportStorageClass.objects.all()
+
+    def post(self, request, *args, **kwargs):
+        storage = self.get_object()
+        if request.data and len(request.data) > 0:
+            if "regex_filter" in request.data:
+                storage.regex_filter = request.data["regex_filter"]
+            if "use_blob_urls" in request.data:
+                storage.use_blob_urls = request.data["use_blob_urls"]
+            if "presign_ttl" in request.data:
+                storage.presign_ttl = request.data["presign_ttl"]
+            storage.save()
+
+            if (
+                "type_import" in request.data
+                and request.data["type_import"] == "dataset"
+            ):
+                try:
+                    from io_storages.functions import get_all_project_storage_with_name
+                    storages = get_all_project_storage_with_name(storage.project.id)
+                except Exception as e:
+                    logger.error(f"Error processing dataset import: {e}")
+
+        storage.validate_connection()
+        storage.sync()
+        storage.sync_export_storage()
+        storage.refresh_from_db()
+        return Response(self.serializer_class(storage).data)
+
+class ExportStorageSyncAPI(generics.GenericAPIView):
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    permission_required = all_permissions.projects_change
+    serializer_class = ExportStorageSerializer
+
+    def get_queryset(self):
+        ExportStorageClass = self.serializer_class.Meta.model
+        return ExportStorageClass.objects.all()
+
+    def post(self, request, *args, **kwargs):
+        storage = self.get_object()
+        storage.validate_connection()
+        storage.sync()
+        storage.refresh_from_db()
+        return Response(self.serializer_class(storage).data)
+
+class StorageValidateAPI(generics.CreateAPIView):
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    permission_required = all_permissions.projects_change
+
+    def create(self, request, *args, **kwargs):
+        instance = None
+        storage_id = request.data.get('id')
+        if storage_id:
+            instance = generics.get_object_or_404(self.serializer_class.Meta.model.objects.all(), pk=storage_id)
+            if not instance.has_permission(request.user):
+                raise PermissionDenied()
+        serializer = self.get_serializer(instance=instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response()
+
+class StorageFormLayoutAPI(generics.RetrieveAPIView):
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    permission_required = all_permissions.projects_change
+    def get(self,):
+        project_id = self.request.query_params.get('project_id')
+        
+        form_layout_file = os.path.join(os.path.dirname(inspect.getfile(self.__class__)), 'form_layout.yml')
+
+        if not os.path.exists(form_layout_file):
+            raise NotFound(f'"form_layout.yml" is not found for {self.__class__.__name__}')
+
+        form_layout = read_yaml(form_layout_file)
+
+        try:
+            project = Project.objects.filter(id=project_id).first()
+
+            data_type =  project.data_types
+            if 'image' in data_type:
+                filter_s3 = f"raw_files_{project.pk}/.+\.(jpg|jpeg|png|gif|svg|webp)"
+            elif 'audio' in data_type:
+                filter_s3 = f"raw_files_{project.pk}/.+\.(mp3|ogg|wav|m4a|m4b|aiff|au|flac)"
+            elif 'video' in data_type:
+                filter_s3 = f"raw_files_{project.pk}/.+\.(mp4|h264|webm|wmv)"
+            else:
+                filter_s3 = f"raw_files_{project.pk}/.+\.(txt|csv|json|tsv)"
+
+            field = next(
+                (field for section in form_layout.get('ImportStorage', []) 
+                for field in section.get('fields', []) 
+                if field and field.get('label') == 'File Filter Regex'),
+                None
+            )
+
+            if field:
+                field['value'] = filter_s3
+                
+        except Exception as e:
+            logger.error(f"Error processing form layout: {e}")
+
+        form_layout = self.post_process_form(form_layout)
+        return Response(form_layout[self.storage_type])
+
+    def post_process_form(self, form_layout):
+        return form_layout
+
+
+class ImportStorageValidateAPI(StorageValidateAPI):
+    serializer_class = ImportStorageSerializer
+
+
+class ExportStorageValidateAPI(StorageValidateAPI):
+    serializer_class = ExportStorageSerializer
+
+
+class ImportStorageFormLayoutAPI(StorageFormLayoutAPI):
+    storage_type = 'ImportStorage'
+
+
+class ExportStorageFormLayoutAPI(StorageFormLayoutAPI):
+    storage_type = 'ExportStorage'
